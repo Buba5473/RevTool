@@ -49,10 +49,17 @@
 - 🧩 **Capstone собирается из исходников** как статическая библиотека (`libcapstone.a`) — в MSYS2 UCRT64 поставляется только динамическая версия.
 - 🧼 **Изолированная сборка** — все действия выполняются в подпапке `build_revtool/`, которая полностью очищается перед началом работы.
 - 🌿 **Пиннинг версий и автоопределение ветки** — RevTool по умолчанию берётся из **default-ветки** репозитория (автоопределение: `master`, `main` и т. п.), Capstone — из стабильного тега `5.0.9`. Обе зависимости клонируются с `--depth 1`; при указании `*_COMMIT` выполняется частичный клон по SHA.
-- 🐧 **Совместимость с Windows 10+** — целевая микроархитектура `x86-64-v3` (AVX2), поддерживаемая всеми актуальными amd64-процессорами.
+- 🐧 **Совместимость с Windows 10+** — целевая микроархитектура `x86-64-v3` (AVX/AVX2/BMI1/BMI2/F16C/FMA/LZCNT/MOVBE/OSXSAVE); требуется CPU с AVX2.
 - 🧩 **Автоматический VT100** — `compat/auto_vt100.h` включает обработку ANSI-цветов
   через `SetConsoleMode(ENABLE_VIRTUAL_TERMINAL_PROCESSING)` — цветной вывод корректно
   отображается в cmd.exe без правки реестра.
+- 🧼 **ANSI-strip при перенаправлении** — тот же `auto_vt100.h` объявляет
+  обёртки `revtool_{printf,fprintf,fputs,puts}` (реализация —
+  `compat/ansi_strip_win32.c`, линкуется в `libmman.a`), которые
+  вырезают CSI-последовательности (`ESC [ … финальный байт`), когда
+  `_isatty(_fileno(f)) == 0`. При `revtool.exe … > out.txt` или
+  `revtool.exe … | …` в файл/пайп попадает чистый текст без «кракозябр»;
+  в консоли цвета сохраняются. Отключается через `-DREVTOOL_NO_ANSI_WRAP`.
 - 🧬 **Авто-восстановление `-DUSE_CAPSTONE=1`** — `CFLAGS` из командной строки скрывает
   Makefile-овский `CFLAGS += -DUSE_CAPSTONE`; скрипт извлекает макрос из Makefile
   (или инжектит дефолт) — компилируется настоящий код Capstone, а не hex-dump fallback.
@@ -119,7 +126,7 @@ pacman -S --needed git \
 
 ## 🔒 Пиннинг версий и переменные окружения
 
-По умолчанию RevTool клонируется из `master`, а Capstone — из тега **`5.0.9`**
+По умолчанию RevTool клонируется из default-ветки (автоопределение `master`/`main`/др.), а Capstone — из тега **`5.0.9`**
 (стабильный релиз). Скрипт печатает итоговые SHA-1 обоих репозиториев перед сборкой.
 
 | Переменная | По умолчанию | Назначение |
@@ -224,7 +231,7 @@ git clone --depth 1 --branch 5.0.9 https://github.com/capstone-engine/capstone.g
 | Флаг | Назначение |
 | :--- | :--- |
 | `-O3` | Максимальная агрессивная оптимизация |
-| `-march=x86-64-v3` | Микроархитектура с AVX2 (совместима с Windows 10+ amd64) |
+| `-march=x86-64-v3` | Микроархитектура уровня v3 (AVX/AVX2/BMI1/BMI2/F16C/FMA/LZCNT/MOVBE/OSXSAVE); требуется CPU с AVX2 |
 | `-flto` | Link-Time Optimization — межмодульная оптимизация |
 | `-DNDEBUG` | Отключение `assert()` и отладочных проверок |
 | `-ffunction-sections` `-fdata-sections` | Гранулярное размещение функций/данных в секциях |
@@ -277,7 +284,15 @@ REVTOOL_CFLAGS_EXTRA="-DUSE_CAPSTONE=1" ./build_revtool.sh
 ANSI-escape рендерятся в терминале без VT100. Скрипт встраивает конструктор,
 включающий `SetConsoleMode(ENABLE_VIRTUAL_TERMINAL_PROCESSING)` до `main()`.
 Если коды всё равно видны — запускайте в **Windows Terminal** или **mintty**.
-Для логов в файл (`revtool.exe ... > out.txt`) чистите так:
+
+При перенаправлении (`revtool.exe ... > out.txt`, `| pipe`) ANSI-последовательности
+вырезаются **автоматически** на уровне `printf`/`fprintf`/`puts`/`fputs`
+(см. `auto_vt100.h` + `compat/ansi_strip_win32.c`): `_isatty() == 0` →
+стриппер удаляет `ESC [ … финальный байт` до записи в поток. Никаких
+«кракозябр» в логах, смена кодовой страницы не требуется.
+
+Если нужен чистый файл из старого лога (до обновления скрипта) или ANSI
+прошли мимо перехваченных функций — почистите вручную:
 
 ```bash
 sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' out.txt
@@ -329,7 +344,7 @@ MINGW64/CLANG64. Это осознанное решение: результат�
 
 ### Сборка на старом CPU
 
-По умолчанию — `-march=x86-64-v3` (AVX2). Для процессоров без AVX2:
+По умолчанию — `-march=x86-64-v3` (требуется CPU с AVX2). Для процессоров без AVX2:
 ```bash
 REVTOOL_MARCH=x86-64-v2 ./build_revtool.sh
 ```
@@ -380,9 +395,10 @@ The build runs in **MSYS2 UCRT64**, uses aggressive compiler optimization, and e
 - 🧩 **Capstone built from source** as a static library (`libcapstone.a`) — MSYS2 UCRT64 ships only the dynamic version.
 - 🧼 **Isolated build** — everything happens in `build_revtool/`, fully wiped on each run.
 - 🌿 **Version pinning & auto-detection** — RevTool comes from the repository's **default branch** (auto-detected: `master`, `main`, etc.), Capstone — from the stable tag `5.0.9`. Both are cloned with `--depth 1`; when a `*_COMMIT` is given, a partial SHA clone is used.
-- 🐧 **Windows 10+ compatibility** — target micro-architecture `x86-64-v3` (AVX2), supported by all modern amd64 CPUs.
+- 🐧 **Windows 10+ compatibility** — target micro-architecture `x86-64-v3` (AVX/AVX2/BMI1/BMI2/F16C/FMA/LZCNT/MOVBE/OSXSAVE); requires CPU with AVX2.
 - 🧩 **POSIX shim for Windows** — RevTool uses `<sys/mman.h>` and `mmap`/`munmap`; the build script generates a local shim (`build_revtool/compat/{sys/mman.h,libmman.a}`) implementing them via `CreateFileMapping`/`MapViewOfFile`/`VirtualAlloc`.
 - 🎨 **Automatic VT100** — `compat/auto_vt100.h` enables ANSI color processing via `SetConsoleMode(ENABLE_VIRTUAL_TERMINAL_PROCESSING)`, so colored output renders correctly in cmd.exe without touching the registry.
+- 🧼 **ANSI strip on redirect** — the same `auto_vt100.h` declares `revtool_{printf,fprintf,fputs,puts}` wrappers (implementation in `compat/ansi_strip_win32.c`, linked via `libmman.a`) that strip CSI sequences (`ESC [ … final byte`) when `_isatty(_fileno(f)) == 0`. With `revtool.exe … > out.txt` or `revtool.exe … | …` the file/pipe gets clean text with no mojibake; in a terminal, colors are preserved. Disable with `-DREVTOOL_NO_ANSI_WRAP`.
 - 🧬 **Auto-restored `-DUSE_CAPSTONE=1`** — the `CFLAGS` override on the command line hides the Makefile's `CFLAGS += -DUSE_CAPSTONE`; the script extracts the macro from the Makefile (or injects the default) so the real Capstone code path is compiled instead of the hex-dump fallback.
 
 ---
@@ -480,8 +496,9 @@ CAPSTONE_COMMIT=$(git ls-remote https://github.com/capstone-engine/capstone.git 
     ├── compat/                      # Windows compatibility shims
     │   ├── sys/mman.h               # mmap/munmap declarations
     │   ├── mman_win32.c             # WinAPI implementation
+    │   ├── ansi_strip_win32.c       # ANSI stripper for non-TTY output
     │   ├── libmman.a                # Static shim library
-    │   └── auto_vt100.h             # VT100 auto-enable (via -include)
+    │   └── auto_vt100.h             # VT100 + printf wrappers (via -include)
     └── revtool_make.log             # Full make output (created on every build)
 ```
 
@@ -518,9 +535,9 @@ CAPSTONE_COMMIT=$(git ls-remote https://github.com/capstone-engine/capstone.git 
 
    `compat/sys/mman.h` + `compat/mman_win32.c` → `compat/libmman.a`. Implements `mmap`, `munmap`, `mprotect`, `msync` via `CreateFileMapping` / `MapViewOfFile` / `VirtualAlloc`.
 
-5. **Generating the VT100 helper**
+5. **Generating the VT100 helper + ANSI stripper**
 
-   `compat/auto_vt100.h` is injected into every translation unit via `-include auto_vt100.h`. A `__attribute__((constructor))` enables `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on stdout/stderr before `main()` — no registry edits.
+   `compat/auto_vt100.h` is injected into every translation unit via `-include auto_vt100.h`. A `__attribute__((constructor))` enables `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on stdout/stderr before `main()` — no registry edits. The same header declares `revtool_{printf,fprintf,fputs,puts}` wrappers and `#define`s them over the standard names; their implementation lives in `compat/ansi_strip_win32.c` (linked via `libmman.a`) and strips CSI sequences when the target stream is not a TTY — redirected logs stay clean.
 
 6. **Restoring `-DUSE_CAPSTONE=1`**
 
@@ -550,7 +567,7 @@ CAPSTONE_COMMIT=$(git ls-remote https://github.com/capstone-engine/capstone.git 
 | Flag | Purpose |
 | :--- | :--- |
 | `-O3` | Maximum aggressive optimization |
-| `-march=x86-64-v3` | Micro-architecture with AVX2 (Windows 10+ amd64 compatible) |
+| `-march=x86-64-v3` | Micro-architecture level v3 (AVX/AVX2/BMI1/BMI2/F16C/FMA/LZCNT/MOVBE/OSXSAVE); requires CPU with AVX2 |
 | `-flto` | Link-Time Optimization |
 | `-DNDEBUG` | Disable `assert()` and debug checks |
 | `-ffunction-sections` `-fdata-sections` | Granular section placement |
@@ -593,7 +610,11 @@ REVTOOL_CFLAGS_EXTRA="-DUSE_CAPSTONE=1" ./build_revtool.sh
 
 ### `\x1b[36m` / `\x1b[1m` garbage in output
 
-ANSI escapes rendered in a terminal without VT100. The build script now embeds a constructor that calls `SetConsoleMode(ENABLE_VIRTUAL_TERMINAL_PROCESSING)` before `main()`. If you still see raw codes, run inside Windows Terminal or mintty. For files (`revtool.exe ... > out.txt`), strip with:
+ANSI escapes rendered in a terminal without VT100. The build script now embeds a constructor that calls `SetConsoleMode(ENABLE_VIRTUAL_TERMINAL_PROCESSING)` before `main()`. If you still see raw codes, run inside Windows Terminal or mintty.
+
+On redirect (`revtool.exe ... > out.txt`, `| pipe`), ANSI sequences are stripped **automatically** at the `printf`/`fprintf`/`puts`/`fputs` level (see `auto_vt100.h` + `compat/ansi_strip_win32.c`): `_isatty() == 0` → the stripper removes `ESC [ … final byte` before writing. No mojibake in logs, no codepage switching required.
+
+If you need to clean up an old log (produced before the script update) or ANSI escapes bypassed the intercepted functions, strip manually:
 
 ```bash
 sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' out.txt
@@ -621,7 +642,7 @@ The script requires `MSYSTEM=UCRT64`. Other environments (MINGW64/CLANG64) are n
 
 ### Older CPU
 
-By default `-march=x86-64-v3` (AVX2). For CPUs without AVX2:
+By default `-march=x86-64-v3` (requires CPU with AVX2). For CPUs without AVX2:
 
 ```bash
 REVTOOL_MARCH=x86-64-v2 ./build_revtool.sh

@@ -93,7 +93,7 @@ if ! grep -qE "^${TARGET}[[:space:]]*:" "$MAKE"; then
 fi
 # $(LDLIBS) должно использоваться в рецептах (строки с отступом),
 # а не просто быть объявлено.
-if grep -qE '^[[:space:]]+.*\$\{?LDLIBS\}?' "$MAKE"; then
+if grep -qE '^[[:space:]]+.*(\$\(LDLIBS\)|\$\{LDLIBS\}|\$LDLIBS([^A-Za-z0-9_]|$))' "$MAKE"; then
     LDLIBS_USED=1
 else
     LDLIBS_USED=0
@@ -125,6 +125,7 @@ cat > "$ROOT/compat/auto_vt100.h" <<'VT100_H_EOF'
 
 #ifdef _WIN32
 #include <windows.h>
+#include <stdio.h>
 
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
@@ -132,13 +133,17 @@ cat > "$ROOT/compat/auto_vt100.h" <<'VT100_H_EOF'
 
 /*
  * Подключается через `-include auto_vt100.h` ко всем TU RevTool.
- * __attribute__((constructor)) кладёт функцию в .CRT$XCU — CRT вызывает
- * её до main(). Если stdout/stderr — реальная консоль, включаем VT100
- * локально для процесса (аналог VirtualTerminalLevel в реестре, но без
- * постоянных изменений в системе). На редиректе / pre-Win10 — no-op.
  *
- * static — чтобы при -include в N TU линковщик не ругался на дубли.
- * Многократный вызов SetConsoleMode идемпотентен.
+ * 1) __attribute__((constructor)) до main() включает VT100 на реальной
+ *    консоли (иначе ANSI-цвета в cmd.exe не рендерятся). Идемпотентно.
+ *
+ * 2) Объявляет revtool_{printf,fprintf,fputs,puts} — обёртки, которые
+ *    вырезают CSI-последовательности (ESC [ ... final), если поток не
+ *    является TTY (_isatty(_fileno(f)) == 0). Реализация — в
+ *    compat/ansi_strip_win32.c (линкуется в libmman.a).
+ *
+ * static — только у конструктора (иначе duplicate symbol при -include
+ * в N TU). Обёртки — extern, определены один раз в .c.
  */
 __attribute__((constructor))
 static void revtool_enable_console_vt100(void)
@@ -153,10 +158,161 @@ static void revtool_enable_console_vt100(void)
     if (hErr != INVALID_HANDLE_VALUE && GetConsoleMode(hErr, &mode))
         SetConsoleMode(hErr, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 }
-#endif /* _WIN32 */
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+int revtool_printf(const char *fmt, ...);
+int revtool_fprintf(FILE *f, const char *fmt, ...);
+int revtool_fputs(const char *s, FILE *f);
+int revtool_puts(const char *s);
+#ifdef __cplusplus
+}
+#endif
+
+/*
+ * Перехват на уровне препроцессора.
+ *
+ * ВАЖНО: `#include <stdio.h>` уже выполнен выше — прототипы stdio не
+ * искажаются. Макросы объявлены ПОСЛЕ, поэтому `int printf(...)` в
+ * stdio.h остаётся настоящим, а все последующие вызовы `printf("...")`
+ * в TU RevTool раскрываются в `revtool_printf(...)`.
+ *
+ * Отключается через -DREVTOOL_NO_ANSI_WRAP (на случай отладки).
+ */
+#ifndef REVTOOL_NO_ANSI_WRAP
+#  define printf(...)  revtool_printf(__VA_ARGS__)
+#  define fprintf(...) revtool_fprintf(__VA_ARGS__)
+#  define fputs(s, f)  revtool_fputs((s), (f))
+#  define puts(s)      revtool_puts(s)
+#endif
+
+#endif /* _WIN32 */
 #endif /* REVTOOL_AUTO_VT100_H */
 VT100_H_EOF
+
+msg "ANSI stripper: генерация compat/ansi_strip_win32.c..."
+cat > "$ROOT/compat/ansi_strip_win32.c" <<'ANSI_STRIP_C_EOF'
+/* ansi_strip_win32.c — ANSI CSI stripper для RevTool.
+ *
+ * revtool_{printf,fprintf,fputs,puts} — обёртки стандартных функций
+ * вывода, которые вырезают ANSI CSI-последовательности (ESC [ ...
+ * финальный байт), если целевой поток не является TTY
+ * (_isatty(_fileno(f)) == 0).
+ *
+ * В консоли поведение идентично стандартным функциям (цвета видны).
+ * При перенаправлении (> file, | pipe) в файл попадает чистый текст,
+ * смена кодовой страницы не требуется.
+ *
+ * Объявления и #define-перехват — в auto_vt100.h (подключается через
+ * -include ко всем TU RevTool).
+ */
+#include <windows.h>
+#include <stdio.h>
+#include <io.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Belt-and-suspenders: если этот файл когда-нибудь скомпилируют с
+ * -include auto_vt100.h — снимаем макросы, чтобы не было рекурсии. */
+#ifdef printf
+#  undef printf
+#endif
+#ifdef fprintf
+#  undef fprintf
+#endif
+#ifdef puts
+#  undef puts
+#endif
+#ifdef fputs
+#  undef fputs
+#endif
+
+static int revtool_needs_strip(FILE *f) {
+    int fd = _fileno(f);
+    return fd >= 0 && !_isatty(fd);
+}
+
+/* Удаляет ESC [ ... final из строки in-place. */
+static void revtool_strip_ansi(char *s) {
+    char *r = s, *w = s;
+    while (*r) {
+        if ((unsigned char)r[0] == 0x1b && r[1] == '[') {
+            r += 2;
+            while (*r && !((unsigned char)*r >= 0x40 && (unsigned char)*r <= 0x7e))
+                r++;
+            if (*r) r++;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = 0;
+}
+
+static int revtool_vfprintf_stripped(FILE *f, const char *fmt, va_list ap) {
+    if (!revtool_needs_strip(f))
+        return vfprintf(f, fmt, ap);
+
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap2);
+    va_end(ap2);
+    if (n < 0) return -1;
+
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) return -1;
+    vsnprintf(buf, (size_t)n + 1, fmt, ap);
+    revtool_strip_ansi(buf);
+    size_t out_len = strlen(buf);
+    size_t wr = fwrite(buf, 1, out_len, f);
+    free(buf);
+    return (wr == out_len) ? (int)out_len : -1;
+}
+
+int revtool_printf(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int r = revtool_vfprintf_stripped(stdout, fmt, ap);
+    va_end(ap); return r;
+}
+
+int revtool_fprintf(FILE *f, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int r = revtool_vfprintf_stripped(f, fmt, ap);
+    va_end(ap); return r;
+}
+
+int revtool_fputs(const char *s, FILE *f) {
+    if (!revtool_needs_strip(f))
+        return fputs(s, f);
+    size_t n = strlen(s);
+    char *buf = (char *)malloc(n + 1);
+    if (!buf) return EOF;
+    memcpy(buf, s, n + 1);
+    revtool_strip_ansi(buf);
+    size_t out_len = strlen(buf);
+    size_t wr = fwrite(buf, 1, out_len, f);
+    free(buf);
+    return (wr == out_len) ? 0 : EOF;
+}
+
+int revtool_puts(const char *s) {
+    if (!revtool_needs_strip(stdout))
+        return puts(s);
+    size_t n = strlen(s);
+    char *buf = (char *)malloc(n + 2);
+    if (!buf) return EOF;
+    memcpy(buf, s, n);
+    buf[n]     = '\n';
+    buf[n + 1] = 0;
+    revtool_strip_ansi(buf);
+    size_t out_len = strlen(buf);
+    size_t wr = fwrite(buf, 1, out_len, stdout);
+    free(buf);
+    return (wr == out_len) ? 0 : EOF;
+}
+ANSI_STRIP_C_EOF
+
 msg "Создание Windows-shim для <sys/mman.h>..."
 mkdir -p "$ROOT/compat/sys"
 cat > "$ROOT/compat/sys/mman.h" <<'MMAN_H_EOF'
@@ -294,7 +450,10 @@ MMAN_C_EOF
 if ! gcc -I"$ROOT/compat" -O2 -c -o "$ROOT/compat/mman_win32.o" "$ROOT/compat/mman_win32.c"; then
     die "Не удалось скомпилировать compat/mman_win32.c"
 fi
-ar rcs "$ROOT/compat/libmman.a" "$ROOT/compat/mman_win32.o" \
+if ! gcc -I"$ROOT/compat" -O2 -c -o "$ROOT/compat/ansi_strip_win32.o" "$ROOT/compat/ansi_strip_win32.c"; then
+    die "Не удалось скомпилировать compat/ansi_strip_win32.c"
+fi
+ar rcs "$ROOT/compat/libmman.a" "$ROOT/compat/mman_win32.o" "$ROOT/compat/ansi_strip_win32.o" \
     || die "Не удалось создать libmman.a (нет ar?)"
 [[ -f $ROOT/compat/libmman.a ]] || die "libmman.a не создан"
 msg "Shim готов: $ROOT/compat/libmman.a"
@@ -317,8 +476,11 @@ base_flag(){
     local name=$1
     # pipefail + set -e: если grep ничего не нашёл (нет CFLAGS в Makefile),
     # труба вернёт 1 и base_flag убьёт скрипт. || true внутри группы — фикс.
+    # Inline-комментарии (от первого '#') отбрасываем: иначе значение
+    # уходит в make, shell съедает всё после '#', теряя наши флаги.
     { grep -E "^${name}[[:space:]]*([+]?=)" "$MAKE" 2>/dev/null || true; } \
         | sed -E "s/^${name}[[:space:]]*[+]?=[[:space:]]*//" \
+        | sed -E 's/#.*$//' \
         | tr '\n' ' ' \
         | sed -E 's/[[:space:]]+/ /g; s/^[[:space:]]+//; s/[[:space:]]+$//'
 }
@@ -337,7 +499,8 @@ FC="${BASE_C:+$BASE_C }-I$ROOT/compat -include auto_vt100.h -I$C_PFX/include -O3
 CAPSTONE_MACRO=""
 if grep -q "USE_CAPSTONE" "$MAKE"; then
     CAPSTONE_MACRO=$(grep -E "^[^#].*(CFLAGS|CPPFLAGS|DEFINES)" "$MAKE" \
-        | grep -oE -- '-D[^ ]*CAPSTONE[^ ]*' \
+        | sed -E 's/#.*$//' \
+        | grep -oE -- '-DUSE_CAPSTONE(=1)?\b' \
         | sort -u | head -1)
     [[ -z $CAPSTONE_MACRO ]] && CAPSTONE_MACRO="-DUSE_CAPSTONE=1"
     msg "Capstone macro: $CAPSTONE_MACRO"
@@ -371,8 +534,14 @@ fi
 # --- Бинарник и стриппинг ---
 BIN=$R_SRC/revtool.exe
 if [[ ! -f $BIN ]]; then
-    BIN=$(find "$R_SRC" -maxdepth 1 -type f -iname '*.exe' -print -quit) || true
-    [[ -n $BIN ]] || die "Исполняемый файл не найден в $R_SRC"
+    mapfile -t _exe_arr < <(find "$R_SRC" -maxdepth 1 -type f -iname '*.exe' | sort)
+    case ${#_exe_arr[@]} in
+        0) die "Исполняемый файл не найден в $R_SRC" ;;
+        1) BIN=${_exe_arr[0]}; msg "Бинарник (fallback): $BIN" ;;
+        *) echo "[!] Найдено несколько .exe в $R_SRC:" >&2
+           printf '    %s\n' "${_exe_arr[@]}" >&2
+           die "Не могу автоматически выбрать бинарник — revtool.exe отсутствует" ;;
+    esac
 fi
 
 SIZE_BEFORE=$(wc -c < "$BIN" | tr -d '[:space:]')
