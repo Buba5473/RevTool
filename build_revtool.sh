@@ -3,7 +3,10 @@
 # Windows 10+ amd64. Запуск из терминала MSYS2 UCRT64.
 # Переменные окружения: REVTOOL_REF/REVTOOL_COMMIT, CAPSTONE_REF/CAPSTONE_COMMIT,
 # REVTOOL_MARCH, REVTOOL_CAPSTONE_ARCHS, REVTOOL_CFLAGS_EXTRA, REVTOOL_LDFLAGS_EXTRA,
-# Если REVTOOL_REF не задан, default-ветка репозитория определяется автоматически (master/main/др.).
+# Если REVTOOL_REF не задан, выполняется `git clone --depth 1` без --branch;
+# имя default-ветки берётся из клона (`rev-parse --abbrev-ref HEAD`).
+# ls-remote для автоопределения не используется — в MSYS2 UCRT64 он может
+# возвращать пустой вывод при рабочем clone.
 set -euo pipefail
 
 die(){ echo "[!] $*" >&2; exit 1; }
@@ -35,46 +38,77 @@ msg "-march=$MARCH; стриппинг: $DO_STRIP (${STRIP_FLAGS})"
 for t in git gcc make cmake ar strip objdump; do
     command -v "$t" &>/dev/null || die "Не найден '$t'. Установите: pacman -S --needed git mingw-w64-ucrt-x86_64-{gcc,make,cmake,binutils}"
 done
+# git часто «найден», но не запускается (exit 127) — проверяем функционально.
+# Причины: битый бинарник, конфликт mingw-w64-ucrt-x86_64-git и msys-git,
+# отсутствующие DLL (libcurl, libssl, zlib, ...).
+if ! GIT_VER=$(git --version 2>/dev/null) || [[ $GIT_VER != git\ version* ]]; then
+    die "git найден в $(command -v git), но не запускается (exit 127). Переустановите: pacman -S --needed --overwrite '*' git"
+fi
 
 # --- Очистка и клонирование ---
 rm -rf "$ROOT" && mkdir -p "$ROOT"
 
 default_branch(){
-    git ls-remote --symref "$1" HEAD 2>/dev/null \
+    local url=$1 ref name head_sha
+
+    # 1. Канонический способ: git ls-remote --symref.
+    #    pipefail + set -e не должны убивать функцию, поэтому || true.
+    ref=$(git ls-remote --symref "$url" HEAD 2>/dev/null \
         | sed -nE 's#^ref:[[:space:]]+refs/heads/([^[:space:]]+)[[:space:]]+HEAD$#\1#p' \
-        | head -1
+        | head -1 || true)
+    if [[ -n $ref ]]; then echo "$ref"; return 0; fi
+
+    # 2. Fallback: пробуем типовые имена веток (Master — у MorenoLopez/RevTool).
+    for name in Master master main trunk; do
+        if git ls-remote --exit-code --heads "$url" "$name" &>/dev/null; then
+            echo "$name"; return 0
+        fi
+    done
+
+    # 3. Fallback: сопоставляем SHA HEAD с refs/heads/*.
+    head_sha=$(git ls-remote "$url" HEAD 2>/dev/null \
+        | awk '{print $1; exit}' || true)
+    if [[ -n $head_sha ]]; then
+        ref=$(git ls-remote --heads "$url" 2>/dev/null \
+            | awk -v sha="$head_sha" '$1==sha {sub("refs/heads/","",$2); print $2; exit}' || true)
+        if [[ -n $ref ]]; then echo "$ref"; return 0; fi
+    fi
+
+    return 1
 }
 
 clone(){ # clone <url> <ref> <commit> <dest>
+    # Стратегия:
+    #   * commit задан            -> init + fetch --depth 1 origin <sha>
+    #   * ref задан (явно)       -> clone --depth 1 --branch <ref>
+    #   * ref пуст               -> clone --depth 1 (git сам выберет default branch)
+    #      ls-remote в MSYS2 UCRT64 может возвращать пусто; не полагаемся на него.
     if [[ -n $3 ]]; then
         mkdir -p "$4"
         git -C "$4" init -q
         git -C "$4" remote add origin "$1"
         if ! git -C "$4" fetch --depth 1 origin "$3" 2>/dev/null; then
-            # fallback: SHA недостижим по прямой ссылке — тянем всю историю
             git -C "$4" fetch origin
         fi
-        # 5.0.9 — аннотированный тег; --detach с тегом пишет warning
-        # "не является коммитом", после чего git сам переключается
-        # на коммит, на который указывает тег. Подавляем шум.
         git -C "$4" checkout --detach --quiet "$3"
-    else
-        local url=$1 ref=$2 dest=$4
-        if [[ -z $ref ]]; then
-            ref=$(default_branch "$url")
-            [[ -n $ref ]] || die "Не удалось определить default-ветку в $url"
-            msg "Ветка не задана — использую default-ветку '$ref'"
-        elif ! git ls-remote --exit-code --heads "$url" "$ref" &>/dev/null \
-             && ! git ls-remote --exit-code --tags "$url" "$ref" &>/dev/null; then
-            local detected
-            detected=$(default_branch "$url")
-            [[ -n $detected ]] || die "Ссылка '$ref' отсутствует в $url, и не удалось определить default-ветку"
-            if [[ "$ref" != "$detected" ]]; then
-                msg "Ссылка '$ref' отсутствует в $url — использую default-ветку '$detected'"
-                ref=$detected
-            fi
+    elif [[ -n $2 ]]; then
+        # Явно заданный ref: пробуем клонировать с --branch; если не вышло —
+        # падаем с диагностикой, но без ls-remote-зависимости.
+        if ! git clone --depth 1 --branch "$2" "$1" "$4" 2>/dev/null; then
+            echo "[!] Не удалось клонировать $1 с ref '$2'" >&2
+            echo "    Доступные ветки:" >&2
+            git ls-remote --heads "$1" 2>/dev/null | sed -E 's#.*refs/heads/#    #' >&2 || true
+            die "Клонирование не удалось (см. список веток выше)"
         fi
-        git clone --depth 1 --branch "$ref" "$url" "$dest"
+    else
+        # Auto-ref: обычный clone без --branch. Git возьмёт default branch.
+        if ! git clone --depth 1 "$1" "$4" 2>/dev/null; then
+            echo "[!] Не удалось клонировать $1" >&2
+            die "Клонирование не удалось"
+        fi
+        local actual
+        actual=$(git -C "$4" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+        [[ -n $actual ]] && msg "Ветка не задана — git выбрал default-ветку '$actual'"
     fi
     msg "$(basename "$4"): $(git -C "$4" rev-parse HEAD)"
 }
@@ -101,12 +135,27 @@ fi
 
 # --- Capstone (static, Release, LTO) ---
 msg "Сборка Capstone..."
+# gcc-ar/gcc-ranlib резолвим в абсолютные Windows-пути: CMake на Windows
+# трактует голое имя `-DCMAKE_AR=gcc-ar` как путь относительно каталога
+# запуска и пытается выполнить C:/.../gcc-ar (не существует). UCRT64
+# может предоставлять только x86_64-w64-mingw32-gcc-ar* в зависимости от
+# раскладки пакета gcc.
+GCC_AR_POSIX=$(command -v gcc-ar 2>/dev/null || command -v x86_64-w64-mingw32-gcc-ar 2>/dev/null || true)
+GCC_RANLIB_POSIX=$(command -v gcc-ranlib 2>/dev/null || command -v x86_64-w64-mingw32-gcc-ranlib 2>/dev/null || true)
+[[ -n $GCC_AR_POSIX ]] || die "gcc-ar не найден (нужен для LTO-архива libcapstone.a). Установите: pacman -S mingw-w64-ucrt-x86_64-gcc"
+[[ -n $GCC_RANLIB_POSIX ]] || die "gcc-ranlib не найден"
+GCC_AR=$(cygpath -w "$GCC_AR_POSIX" 2>/dev/null || echo "$GCC_AR_POSIX")
+GCC_RANLIB=$(cygpath -w "$GCC_RANLIB_POSIX" 2>/dev/null || echo "$GCC_RANLIB_POSIX")
+msg "gcc-ar: $GCC_AR"
+msg "gcc-ranlib: $GCC_RANLIB"
+
 CAP_ARGS=()
 [[ -n $CAP_ARCHS ]] && CAP_ARGS=(-DCAPSTONE_ARCHS="$CAP_ARCHS")
 cmake -S "$C_SRC" -B "$C_SRC/build" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$C_PFX" \
     -DBUILD_SHARED_LIBS=OFF -DCAPSTONE_BUILD_TESTS=OFF \
     -DCMAKE_C_FLAGS="-O3 -march=$MARCH -flto -DNDEBUG -ffunction-sections -fdata-sections" \
+    -DCMAKE_AR="$GCC_AR" -DCMAKE_RANLIB="$GCC_RANLIB" \
     -DCMAKE_EXE_LINKER_FLAGS="-flto -static" \
     "${CAP_ARGS[@]}"
 cmake --build "$C_SRC/build" --config Release --parallel
@@ -145,19 +194,8 @@ cat > "$ROOT/compat/auto_vt100.h" <<'VT100_H_EOF'
  * static — только у конструктора (иначе duplicate symbol при -include
  * в N TU). Обёртки — extern, определены один раз в .c.
  */
-__attribute__((constructor))
-static void revtool_enable_console_vt100(void)
-{
-    DWORD mode = 0;
-
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &mode))
-        SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-
-    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
-    if (hErr != INVALID_HANDLE_VALUE && GetConsoleMode(hErr, &mode))
-        SetConsoleMode(hErr, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-}
+/* реализация перенесена в ansi_strip_win32.c */
+void revtool_enable_console_vt100(void);
 
 #ifdef __cplusplus
 extern "C" {
@@ -181,10 +219,12 @@ int revtool_puts(const char *s);
  * Отключается через -DREVTOOL_NO_ANSI_WRAP (на случай отладки).
  */
 #ifndef REVTOOL_NO_ANSI_WRAP
-#  define printf(...)  revtool_printf(__VA_ARGS__)
-#  define fprintf(...) revtool_fprintf(__VA_ARGS__)
-#  define fputs(s, f)  revtool_fputs((s), (f))
-#  define puts(s)      revtool_puts(s)
+#  ifndef __cplusplus
+#    define printf(...)  revtool_printf(__VA_ARGS__)
+#    define fprintf(...) revtool_fprintf(__VA_ARGS__)
+#    define fputs(s, f)  revtool_fputs((s), (f))
+#    define puts(s)      revtool_puts(s)
+#  endif
 #endif
 
 #endif /* _WIN32 */
@@ -208,6 +248,10 @@ cat > "$ROOT/compat/ansi_strip_win32.c" <<'ANSI_STRIP_C_EOF'
  * -include ко всем TU RevTool).
  */
 #include <windows.h>
+
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
 #include <stdio.h>
 #include <io.h>
 #include <stdarg.h>
@@ -229,9 +273,30 @@ cat > "$ROOT/compat/ansi_strip_win32.c" <<'ANSI_STRIP_C_EOF'
 #  undef fputs
 #endif
 
-static int revtool_needs_strip(FILE *f) {
+/* Включение VT100 на реальной консоли до main(). Идемпотентно. */
+__attribute__((constructor))
+void revtool_enable_console_vt100(void)
+{
+    DWORD mode = 0;
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &mode))
+        SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
+    if (hErr != INVALID_HANDLE_VALUE && GetConsoleMode(hErr, &mode))
+        SetConsoleMode(hErr, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
+
+static int revtool_is_console(FILE *f) {
     int fd = _fileno(f);
-    return fd >= 0 && !_isatty(fd);
+    if (fd < 0) return 0;
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    DWORD mode;
+    return GetConsoleMode(h, &mode) != 0;
+}
+
+static int revtool_needs_strip(FILE *f) {
+    return !revtool_is_console(f);
 }
 
 /* Удаляет ESC [ ... final из строки in-place. */
@@ -330,6 +395,9 @@ cat > "$ROOT/compat/sys/mman.h" <<'MMAN_H_EOF'
 #ifndef PROT_EXEC
 #define PROT_EXEC  0x4
 #endif
+#ifndef PROT_NONE
+#define PROT_NONE  0x0
+#endif
 
 #ifndef MAP_SHARED
 #define MAP_SHARED    0x01
@@ -345,6 +413,10 @@ cat > "$ROOT/compat/sys/mman.h" <<'MMAN_H_EOF'
 #endif
 #ifndef MAP_ANON
 #define MAP_ANON      MAP_ANONYMOUS
+#endif
+
+#ifndef MAP_POPULATE
+#define MAP_POPULATE 0x8000
 #endif
 
 #define MAP_FAILED ((void *)-1)
@@ -377,6 +449,7 @@ cat > "$ROOT/compat/mman_win32.c" <<'MMAN_C_EOF'
 #include <errno.h>
 
 static DWORD pick_page_prot(int prot) {
+    if (prot == PROT_NONE) return PAGE_NOACCESS;
     if (prot & PROT_EXEC) return PAGE_EXECUTE_READWRITE;
     if (prot & PROT_WRITE) return PAGE_READWRITE;
     return PAGE_READONLY;
@@ -442,7 +515,8 @@ int mprotect(void *addr, size_t len, int prot) {
 }
 
 int msync(void *addr, size_t length, int flags) {
-    (void)addr; (void)length; (void)flags;
+    (void)flags;
+    FlushViewOfFile(addr, length);  /* best-effort */
     return 0;
 }
 MMAN_C_EOF
@@ -478,13 +552,13 @@ base_flag(){
     # труба вернёт 1 и base_flag убьёт скрипт. || true внутри группы — фикс.
     # Inline-комментарии (от первого '#') отбрасываем: иначе значение
     # уходит в make, shell съедает всё после '#', теряя наши флаги.
-    { grep -E "^${name}[[:space:]]*([+]?=)" "$MAKE" 2>/dev/null || true; } \
-        | sed -E "s/^${name}[[:space:]]*[+]?=[[:space:]]*//" \
+    { grep -E "^${name}[[:space:]]*([+]?=|:=|\?=)" "$MAKE" 2>/dev/null || true; } \
+        | sed -E "s/^${name}[[:space:]]*([+]?=|:=|\?=)[[:space:]]*//" \
         | sed -E 's/#.*$//' \
         | tr '\n' ' ' \
         | sed -E 's/[[:space:]]+/ /g; s/^[[:space:]]+//; s/[[:space:]]+$//'
 }
-BASE_C=$(base_flag CFLAGS || true); BASE_L=$(base_flag LDFLAGS || true)
+BASE_C=$(base_flag CFLAGS || true); BASE_L=$(base_flag LDFLAGS || true); BASE_LDLIBS=$(base_flag LDLIBS || true)
 [[ -n $BASE_C ]] && msg "Базовые CFLAGS из Makefile: $BASE_C"
 [[ -n $BASE_L ]] && msg "Базовые LDFLAGS из Makefile: $BASE_L"
 
@@ -514,7 +588,7 @@ msg "TARGET=$TARGET, LDLIBS_USED=$LDLIBS_USED, CAPSTONE_MACRO=${CAPSTONE_MACRO:-
 if [[ $LDLIBS_USED == 1 ]]; then
     MAKE_LOG=$ROOT/revtool_make.log
     msg "Лог make: $MAKE_LOG (можно мониторить: tail -f \"$MAKE_LOG\")"
-    if ! make -C "$R_SRC" "$TARGET" CC=gcc CFLAGS="$FC" LDFLAGS="$FL" LDLIBS="-L$C_PFX/lib -lcapstone -lmman" 2>&1 | tee "$MAKE_LOG"; then
+    if ! make -C "$R_SRC" "$TARGET" CC=gcc CFLAGS="$FC" LDFLAGS="$FL" LDLIBS="${BASE_LDLIBS:+$BASE_LDLIBS }-L$C_PFX/lib -lcapstone -lmman" 2>&1 | tee "$MAKE_LOG"; then
         echo "[!] make завершился с ошибкой. Хвост лога $MAKE_LOG:" >&2
         tail -80 "$MAKE_LOG" >&2
         exit 1
@@ -558,7 +632,9 @@ fi
 msg "Готово: $BIN"
 file "$BIN" 2>/dev/null || true
 
-DLLS=$(objdump -p "$BIN" 2>/dev/null | sed -nE 's/.*DLL Name:[[:space:]]*//p' || true)
+if ! DLLS=$(objdump -p "$BIN" 2>/dev/null | sed -nE 's/.*DLL Name:[[:space:]]*//p'); then
+    die "objdump не смог проанализировать $BIN"
+fi
 if [[ -n $DLLS ]]; then
     echo "$DLLS" | sed 's/^/    /'
     # Whitelist: разрешены только системные DLL Windows. Любая другая — ошибка.
@@ -577,6 +653,9 @@ if [[ $SKIP_SMOKE == 1 ]]; then
     msg "Smoke-тест пропущен (REVTOOL_SKIP_SMOKE=1)"
 elif V=$("$BIN" --version 2>&1); then
     echo "$V" | sed 's/^/    /'
+    if ! "$BIN" info "$BIN" >/dev/null 2>&1; then
+        die "Smoke-тест (info) провален"
+    fi
 else
     die "Smoke-тест провален: $BIN --version завершился с ошибкой"
 fi

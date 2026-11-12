@@ -131,8 +131,8 @@ pacman -S --needed git \
 
 | Переменная | По умолчанию | Назначение |
 | :--- | :--- | :--- |
-| `REVTOOL_REF` / `REVTOOL_COMMIT` | *(default-ветка)* / — | Ветка/тег или точный SHA RevTool; если не задано — определяется default-ветка репозитория |
-| `CAPSTONE_REF` / `CAPSTONE_COMMIT` | `5.0.9` / — | Ветка/тег или точный SHA Capstone |
+| `REVTOOL_REF` / `REVTOOL_COMMIT` | *(auto)* / — | Ветка/тег (`REF`) или точный SHA (`COMMIT`) RevTool. Если `REF` не задан, выполняется `git clone --depth 1` без `--branch` — git сам выбирает default-ветку (у `MorenoLopez/RevTool` это `Master`), а имя ветки читается из клона. `ls-remote` для автоопределения не используется. Для полной воспроизводимости задайте `REVTOOL_COMMIT` |
+| `CAPSTONE_REF` / `CAPSTONE_COMMIT` | `5.0.9` / — | Ветка/тег (`REF`) или точный SHA (`COMMIT`) Capstone |
 | `REVTOOL_MARCH` | `x86-64-v3` | Целевая микроархитектура (для старых CPU — `x86-64-v2`) |
 | `REVTOOL_CAPSTONE_ARCHS` | *(все)* | Напр. `X86` — резко сокращает время сборки Capstone |
 | `REVTOOL_NO_STRIP` | `0` | `1` — отключить стриппинг |
@@ -342,6 +342,64 @@ $(TARGET): $(OBJ)
 MINGW64/CLANG64. Это осознанное решение: результаты в других окружениях
 не гарантированы.
 
+### `git` найден, но не запускается (`exit 127`)
+
+`command -v git` возвращает путь, но `git --version` завершается с
+ошибкой `exit 127` (обычно «exec format error» или отсутствует DLL).
+Скрипт сборки теперь проверяет это функционально и падает с понятным
+сообщением до начала клонирования.
+
+Причины и решение:
+
+1. Битый пакет `git` — переустановите:
+
+   ```bash
+   pacman -Syu
+   pacman -S --needed --overwrite '*' git
+   hash -r
+   git --version   # должна быть версия
+   ```
+
+2. Конфликт `mingw-w64-ucrt-x86_64-git` и штатного `/usr/bin/git` —
+   удалите mingw-вариант:
+
+   ```bash
+   pacman -R mingw-w64-ucrt-x86_64-git
+   hash -r
+   which git    # должно быть /usr/bin/git
+   ```
+
+3. Отсутствуют зависимости — проверьте `ldd /ucrt64/bin/git` (или
+   `/usr/bin/git`); при `not found` переустановите пакет.
+
+### `gcc-ar` не является внутренней или внешней командой
+
+CMake на Windows трактует голое `-DCMAKE_AR=gcc-ar` как путь относительно
+каталога запуска и вызывает `C:/.../gcc-ar` — файла нет. Скрипт теперь
+резолвит `gcc-ar`/`gcc-ranlib` через `command -v` (с фолбэком на
+`x86_64-w64-mingw32-gcc-ar`), конвертирует POSIX-путь в Windows-путь
+через `cygpath -w` и передаёт CMake абсолютные пути.
+
+Если `gcc-ar` действительно отсутствует — переустановите gcc:
+
+```bash
+pacman -S --needed --overwrite '*' mingw-w64-ucrt-x86_64-gcc
+```
+
+### `PROT_NONE undeclared` в `compat/mman_win32.c`
+
+В генерируемом `sys/mman.h` не был определён `PROT_NONE` (POSIX: `0x0`),
+хотя `mman_win32.c` его использует в `pick_page_prot()`. Скрипт теперь
+добавляет `#define PROT_NONE 0x0` вместе с `PROT_READ/WRITE/EXEC`.
+
+### `gcc.exe: error: CFLAGS: linker input file not found`
+
+`base_flag()` корректно извлекает значение из `CFLAGS ?= ...` /
+`CFLAGS := ...`, но sed, вырезающий префикс, знал только про `=` и
+`+=`. В результате `CFLAGS ?= -O2 ...` попадал в `CFLAGS` целиком, и
+gcc воспринимал `CFLAGS` и `?=` как входные файлы. Теперь sed
+симметричен grep и вырезает `=`, `+=`, `:=` и `?=`.
+
 ### Сборка на старом CPU
 
 По умолчанию — `-march=x86-64-v3` (требуется CPU с AVX2). Для процессоров без AVX2:
@@ -459,8 +517,8 @@ By default RevTool is cloned from the repository's default branch (auto-detected
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
-| `REVTOOL_REF` / `REVTOOL_COMMIT` | *(default branch)* / — | Branch/tag or exact SHA of RevTool; if unset, the repository's default branch is used |
-| `CAPSTONE_REF` / `CAPSTONE_COMMIT` | `5.0.9` / — | Branch/tag or exact SHA of Capstone |
+| `REVTOOL_REF` / `REVTOOL_COMMIT` | *(auto)* / — | Branch/tag (`REF`) or exact SHA (`COMMIT`) of RevTool. If `REF` is unset, a plain `git clone --depth 1` (no `--branch`) is used — git picks the default branch (`Master` for `MorenoLopez/RevTool`), and the branch name is read from the clone. `ls-remote` is not used for auto-detection. For full reproducibility, set `REVTOOL_COMMIT` |
+| `CAPSTONE_REF` / `CAPSTONE_COMMIT` | `5.0.9` / — | Branch/tag (`REF`) or exact SHA (`COMMIT`) of Capstone |
 | `REVTOOL_MARCH` | `x86-64-v3` | Target micro-architecture (`x86-64-v2` for older CPUs) |
 | `REVTOOL_CAPSTONE_ARCHS` | *(all)* | e.g. `X86` — dramatically cuts Capstone build time |
 | `REVTOOL_NO_STRIP` | `0` | `1` — disable stripping |
@@ -639,6 +697,70 @@ The script auto-detects `$(LDLIBS)` in recipes and switches to the correct link 
 ### `[!] Требуется окружение MSYS2 UCRT64`
 
 The script requires `MSYSTEM=UCRT64`. Other environments (MINGW64/CLANG64) are not supported.
+
+### `Не удалось определить default-ветку`
+
+Скрипт пробует `git ls-remote --symref`, затем типовые имена веток
+(`Master`, `master`, `main`, `trunk`), затем сопоставление SHA `HEAD`
+с `refs/heads/*`. Если всё не удалось — проверьте сеть/доступ и
+задайте ветку явно:
+
+```bash
+REVTOOL_REF=Master ./build_revtool.sh
+```
+
+### `git` is found but does not run (`exit 127`)
+
+`command -v git` returns a path, but `git --version` exits with code
+`127` (usually "exec format error" or a missing DLL). The build script
+now verifies git functionally and aborts with a clear message before
+cloning.
+
+Causes and fixes:
+
+1. Broken `git` package — reinstall:
+
+   ```bash
+   pacman -Syu
+   pacman -S --needed --overwrite '*' git
+   hash -r
+   git --version
+   ```
+
+2. Conflict between `mingw-w64-ucrt-x86_64-git` and the stock
+   `/usr/bin/git` — remove the mingw one:
+
+   ```bash
+   pacman -R mingw-w64-ucrt-x86_64-git
+   hash -r
+   which git    # should be /usr/bin/git
+   ```
+
+3. Missing dependencies — check `ldd /ucrt64/bin/git` (or
+   `/usr/bin/git`); on `not found`, reinstall the package.
+
+### `gcc-ar` is not recognized as a command
+
+CMake on Windows treats a bare `-DCMAKE_AR=gcc-ar` as a path relative
+to its working directory and tries to run `C:/.../gcc-ar` — which does
+not exist. The script now resolves `gcc-ar`/`gcc-ranlib` via
+`command -v` (falling back to `x86_64-w64-mingw32-gcc-ar`), converts
+the POSIX path to a Windows path via `cygpath -w`, and passes
+absolute paths to CMake.
+
+If `gcc-ar` is really missing — reinstall gcc:
+
+```bash
+pacman -S --needed --overwrite '*' mingw-w64-ucrt-x86_64-gcc
+```
+
+### `gcc.exe: error: CFLAGS: linker input file not found`
+
+`base_flag()` extracted the value from `CFLAGS ?= ...` /
+`CFLAGS := ...` correctly, but the sed that strips the prefix only
+knew about `=` and `+=`. As a result, `CFLAGS ?= -O2 ...` reached
+gcc verbatim, and gcc treated `CFLAGS` and `?=` as input files. The
+sed now mirrors the grep pattern and strips `=`, `+=`, `:=`, and `?=`.
 
 ### Older CPU
 
